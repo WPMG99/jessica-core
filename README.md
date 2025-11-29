@@ -1,0 +1,208 @@
+# Jessica Core
+
+A cognitive prosthetic and battle buddy AI system built for disabled veterans. Jessica is a Marine who happens to be an AI, designed to work WITH how the brain functions, not against it.
+
+## Overview
+
+Jessica Core is a Flask-based API server that provides intelligent routing between multiple AI providers (Claude, Grok, Gemini, and local Ollama) based on task type. It includes dual memory storage (local ChromaDB + Mem0 cloud) and supports voice transcription via Whisper.
+
+## Features
+
+- **Three-Tier Intelligent Routing**: Automatically routes requests to the best AI provider based on task type
+  - Research tasks → Grok (web access)
+  - Complex reasoning → Claude
+  - Document/lookup tasks → Gemini
+  - Standard tasks → Local Ollama (Dolphin)
+- **Dual Memory System**: Stores conversations in both local ChromaDB and Mem0 cloud
+- **Voice Transcription**: Integration with Whisper service for audio transcription
+- **Multiple AI Providers**: Support for Anthropic Claude, X.AI Grok, Google Gemini, and local Ollama
+
+## Prerequisites
+
+### Local Services Required
+
+1. **Ollama** (running on `localhost:11434`)
+   - Install from [ollama.ai](https://ollama.ai)
+   - Pull the model: `ollama pull dolphin-llama3:8b`
+
+2. **Whisper Service** (running on `localhost:5000`)
+   - Separate service for audio transcription
+
+3. **Memory Service** (running on `localhost:5001`)
+   - Local ChromaDB service for memory storage
+
+### Python Requirements
+
+- Python 3.12+
+- Virtual environment (recommended)
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone <repository-url>
+cd jessica-core
+```
+
+2. Create and activate virtual environment:
+```bash
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+## Configuration
+
+### Environment Variables
+
+Set the following environment variables before running:
+
+```bash
+export ANTHROPIC_API_KEY="your-claude-api-key"
+export XAI_API_KEY="your-grok-api-key"
+export GOOGLE_AI_API_KEY="your-gemini-api-key"
+export MEM0_API_KEY="your-mem0-api-key"
+```
+
+On Windows:
+```powershell
+$env:ANTHROPIC_API_KEY="your-claude-api-key"
+$env:XAI_API_KEY="your-grok-api-key"
+$env:GOOGLE_AI_API_KEY="your-gemini-api-key"
+$env:MEM0_API_KEY="your-mem0-api-key"
+```
+
+### Master Prompt
+
+Ensure `master_prompt.txt` is in the same directory as `jessica_core.py`. This file contains Jessica's core personality and operating instructions.
+
+## Usage
+
+### Starting the Server
+
+```bash
+python jessica_core.py
+```
+
+The server will start on `http://0.0.0.0:8000`
+
+### API Endpoints
+
+#### POST `/chat`
+Main chat endpoint for interacting with Jessica.
+
+**Request:**
+```json
+{
+  "message": "What's the weather like?",
+  "provider": "claude"  // Optional: force specific provider
+}
+```
+
+**Response:**
+```json
+{
+  "response": "Jessica's response here...",
+  "routing": {
+    "provider": "grok",
+    "tier": 1,
+    "reason": "Research task detected - using Grok for web access"
+  }
+}
+```
+
+#### GET `/status`
+Check status of all API connections and local services.
+
+**Response:**
+```json
+{
+  "local_ollama": true,
+  "local_memory": true,
+  "claude_api": true,
+  "grok_api": true,
+  "gemini_api": true,
+  "mem0_api": true
+}
+```
+
+#### POST `/transcribe`
+Transcribe audio file.
+
+**Request:** Multipart form data with `audio` file
+
+#### POST `/memory/cloud/search`
+Search cloud memories.
+
+**Request:**
+```json
+{
+  "query": "search term"
+}
+```
+
+#### GET `/memory/cloud/all`
+Get all cloud memories for the user.
+
+## Routing Logic
+
+Jessica uses intelligent routing based on keywords:
+
+- **Research Keywords**: "research", "look up", "find out", "what's happening", "current", "news", "latest", "search", "investigate", "dig into"
+  → Routes to **Grok**
+
+- **Complex Reasoning Keywords**: "analyze", "strategy", "plan", "complex", "detailed", "comprehensive", "deep dive", "break down", "explain thoroughly", "compare", "evaluate", "business decision", "architecture", "design"
+  → Routes to **Claude**
+
+- **Document Keywords**: "summarize", "document", "pdf", "file", "extract", "quick lookup", "definition", "what is", "explain briefly"
+  → Routes to **Gemini**
+
+- **Default**: All other tasks route to **Local Ollama**
+
+You can also explicitly specify a provider by including `"provider": "claude"` (or "grok", "gemini", "local") in the request.
+
+## Architecture
+
+- **Flask**: Web framework
+- **Requests**: HTTP client with connection pooling
+- **LRU Cache**: Caching for master prompt loading
+- **Threading**: Non-blocking memory storage
+
+## Project Structure
+
+```
+jessica-core/
+├── jessica_core.py      # Main application file
+├── master_prompt.txt    # Jessica's core personality and instructions
+├── requirements.txt     # Python dependencies
+├── README.md           # This file
+├── CODE_REVIEW.md      # Code review and improvement suggestions
+└── venv/               # Virtual environment (excluded from git)
+```
+
+## Development
+
+### Code Quality
+
+See `CODE_REVIEW.md` for code review findings and improvement suggestions.
+
+### Contributing
+
+This is a private project. For contributions, please coordinate with the project maintainer.
+
+## License
+
+Private project - All rights reserved.
+
+## Support
+
+For issues or questions, contact the project maintainer.
+
+---
+
+**Semper Fi, brother. For the forgotten 99%, we rise.**
+
