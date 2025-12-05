@@ -8,6 +8,11 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from functools import lru_cache
 from typing import Optional, Dict, List, Tuple
+from dotenv import load_dotenv
+
+# Load environment variables from .env file BEFORE accessing them
+# This fixes the issue where bashrc exports don't reach non-interactive shells
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -48,16 +53,25 @@ MEM0_USER_ID = "PhyreBug"
 # =============================================================================
 DEFAULT_MAX_TOKENS = 2048
 MEMORY_TRUNCATE_LENGTH = 200
-# Primary: dolphin-mixtral (47B MoE, uncensored, better personality)
-# Fallback: dolphin-llama3:8b (if mixtral not available)
-DEFAULT_OLLAMA_MODEL = "dolphin-mixtral"
-FALLBACK_OLLAMA_MODEL = "dolphin-llama3:8b"
+# Primary: jessica (custom model with master_prompt baked in - no system prompt needed!)
+# Fallback: qwen2.5:32b (if custom model unavailable)
+DEFAULT_OLLAMA_MODEL = "jessica"
+FALLBACK_OLLAMA_MODEL = "qwen2.5:32b"
+
+# Jessica Modes - different specialized models for different contexts
+JESSICA_MODES = {
+    "default": "jessica",           # Core personality, general use
+    "business": "jessica-business", # WyldePhyre operations focus
+    # Future modes:
+    # "writing": "jessica-writing",   # Nexus Arcanum creative writing
+    # "crisis": "jessica-crisis",     # Mental health crisis support
+}
 
 # Timeouts (configurable via environment variables)
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "60"))
 LOCAL_SERVICE_TIMEOUT = int(os.getenv("LOCAL_SERVICE_TIMEOUT", "5"))
 HEALTH_CHECK_TIMEOUT = int(os.getenv("HEALTH_CHECK_TIMEOUT", "2"))
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "300"))  # 5 min for 32B model first load
 MEM0_TIMEOUT = int(os.getenv("MEM0_TIMEOUT", "30"))
 
 # =============================================================================
@@ -582,21 +596,24 @@ def detect_routing_tier(message: str, explicit_directive: str = None) -> tuple:
     return ("local", 1, "Standard task - using local Dolphin")
 
 
-def call_local_ollama(system_prompt: str, user_message: str, model: str = DEFAULT_OLLAMA_MODEL) -> str:
-    """Call local Ollama with Dolphin model using generate API
+def call_local_ollama(system_prompt: str, user_message: str, model: str = DEFAULT_OLLAMA_MODEL, 
+                      fallback_system_prompt: str = None) -> str:
+    """Call local Ollama with custom or fallback model using generate API
     
     Args:
-        system_prompt: System instructions (master prompt + context)
+        system_prompt: System instructions for primary model (may be minimal for custom models)
         user_message: The user's message
-        model: Ollama model name (default: dolphin-mixtral)
+        model: Ollama model name (default: jessica custom model)
+        fallback_system_prompt: Full system prompt for fallback models (generic models need this!)
     
-    Falls back to dolphin-llama3:8b if primary model unavailable.
+    Custom models (jessica, jessica-business) have personality baked in via Modelfile.
+    Fallback models (qwen2.5:32b) are generic and need the full system prompt.
     """
-    def try_model(model_name: str) -> tuple:
-        """Try to call a specific model, return (success, response)"""
+    def try_model(model_name: str, prompt: str) -> tuple:
+        """Try to call a specific model with given system prompt, return (success, response)"""
         payload = {
             "model": model_name,
-            "system": system_prompt,
+            "system": prompt,
             "prompt": user_message,
             "stream": False,
             "options": {
@@ -606,7 +623,7 @@ def call_local_ollama(system_prompt: str, user_message: str, model: str = DEFAUL
         }
         
         logger.info(f"Ollama Generate API - Model: {model_name}")
-        logger.info(f"System prompt length: {len(system_prompt)} characters")
+        logger.info(f"System prompt length: {len(prompt)} characters")
         logger.info(f"User message: {user_message}")
         
         response = http_session.post(
@@ -618,9 +635,9 @@ def call_local_ollama(system_prompt: str, user_message: str, model: str = DEFAUL
         data = response.json()
         return True, data.get('response', 'Error: No response from local model')
     
-    # Try primary model first
+    # Try primary model first (custom models have personality baked in)
     try:
-        success, response = try_model(model)
+        success, response = try_model(model, system_prompt)
         return response
     except Exception as e:
         logger.warning(f"Primary model {model} failed: {e}")
@@ -629,7 +646,10 @@ def call_local_ollama(system_prompt: str, user_message: str, model: str = DEFAUL
         if model != FALLBACK_OLLAMA_MODEL:
             try:
                 logger.info(f"Trying fallback model: {FALLBACK_OLLAMA_MODEL}")
-                success, response = try_model(FALLBACK_OLLAMA_MODEL)
+                # CRITICAL: Use full system prompt for fallback - generic models need personality!
+                fallback_prompt = fallback_system_prompt if fallback_system_prompt else system_prompt
+                logger.info(f"Fallback using {'full' if fallback_system_prompt else 'original'} system prompt")
+                success, response = try_model(FALLBACK_OLLAMA_MODEL, fallback_prompt)
                 return response
             except Exception as e2:
                 logger.error(f"Fallback model also failed: {e2}")
@@ -793,6 +813,9 @@ def mem0_search_memories(query: str, limit: int = 5) -> list:
         response.raise_for_status()
         
         data = response.json()
+        # Handle both list (new API) and dict (old API) response formats
+        if isinstance(data, list):
+            return data
         return data.get("results", [])
     except Exception as e:
         logger.error(f"Mem0 search error: {e}")
@@ -815,6 +838,9 @@ def mem0_get_all_memories() -> list:
         response.raise_for_status()
         
         data = response.json()
+        # Handle both list (new API) and dict (old API) response formats
+        if isinstance(data, list):
+            return data
         return data.get("results", [])
     except Exception as e:
         logger.error(f"Mem0 get all error: {e}")
@@ -885,7 +911,15 @@ def recall_memory_dual(query: str) -> Dict[str, List[str]]:
     
     try:
         cloud_memories = mem0_search_memories(query, limit=3)
-        context["cloud"] = [m.get("memory", "") for m in cloud_memories]
+        # Handle different Mem0 response formats
+        cloud_texts = []
+        for m in cloud_memories:
+            if isinstance(m, str):
+                cloud_texts.append(m)
+            elif isinstance(m, dict):
+                # Try common keys: memory, text, content
+                cloud_texts.append(m.get("memory", m.get("text", m.get("content", str(m)))))
+        context["cloud"] = cloud_texts
     except Exception as e:
         logger.error(f"Mem0 recall failed: {e}")
     
@@ -898,9 +932,8 @@ def recall_memory_dual(query: str) -> Dict[str, List[str]]:
 
 @lru_cache(maxsize=1)
 def _load_master_prompt():
-    """Load and cache master prompt file"""
+    """Load and cache master prompt file (for Claude/external APIs)"""
     try:
-        # Get the directory where this script is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
         prompt_path = os.path.join(script_dir, 'master_prompt.txt')
         with open(prompt_path, 'r', encoding='utf-8') as f:
@@ -908,6 +941,19 @@ def _load_master_prompt():
     except FileNotFoundError:
         logger.warning("master_prompt.txt not found, using default")
         return "You are Jessica, a helpful AI assistant."
+
+
+@lru_cache(maxsize=1)
+def _load_local_prompt():
+    """Load condensed prompt for local Ollama (34B models need shorter prompts)"""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        prompt_path = os.path.join(script_dir, 'jessica_local_prompt.txt')
+        with open(prompt_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        logger.warning("jessica_local_prompt.txt not found, using master_prompt")
+        return _load_master_prompt()
 
 
 # =============================================================================
@@ -923,9 +969,15 @@ def chat():
     data = request.json
     user_message = data['message']
     explicit_directive = data.get('provider', None)
+    jessica_mode = data.get('mode', 'default')  # default, business, etc.
     
-    # Use cached master prompt (no file I/O on every request)
-    master_prompt = _load_master_prompt()
+    # Get the appropriate model for the selected mode
+    active_model = JESSICA_MODES.get(jessica_mode, JESSICA_MODES['default'])
+    logger.info(f"Jessica Mode: {jessica_mode} -> Model: {active_model}")
+    
+    # Load prompts (cached, no file I/O on every request)
+    master_prompt = _load_master_prompt()     # Full prompt for Claude
+    local_prompt = _load_local_prompt()       # Condensed prompt for local Ollama
     
     memory_context = recall_memory_dual(user_message)
     provider, tier, reason = detect_routing_tier(user_message, explicit_directive)
@@ -955,12 +1007,18 @@ def chat():
     gemini_system_prompt = f"{GEMINI_SYSTEM_PROMPT}{context_text}"
     gemini_user_message = f"User: {user_message}"
     
-    # For Ollama: Use SHORT prompt that Dolphin can actually follow
-    # Claude gets the full master_prompt for complex reasoning
-    dolphin_prompt = f"{DOLPHIN_SYSTEM_PROMPT}{context_text}"
+    # For Ollama: Custom "jessica" model has master_prompt baked in
+    # Only send memory context, not the full prompt (saves tokens, faster!)
+    local_ollama_prompt = context_text if context_text else ""
+    
+    # Fallback prompt for generic models (qwen2.5:32b) - they need full personality!
+    # Uses local_prompt (condensed version optimized for local models) + memory context
+    fallback_ollama_prompt = f"{local_prompt}{context_text}"
     
     provider_map = {
-        "local": lambda: call_local_ollama(dolphin_prompt, user_message),
+        "local": lambda: call_local_ollama(local_ollama_prompt, user_message, 
+                                           model=active_model, 
+                                           fallback_system_prompt=fallback_ollama_prompt),
         "claude": lambda: call_claude_api(user_message, master_prompt + context_text),
         "grok": lambda: call_grok_api(user_message, grok_system_prompt),
         "gemini": lambda: call_gemini_api(gemini_user_message, gemini_system_prompt)
@@ -1020,6 +1078,25 @@ def status():
         logger.error(f"Memory service status check failed: {e}")
     
     return jsonify(api_status)
+
+
+@app.route('/modes', methods=['GET'])
+def get_modes():
+    """Return available Jessica modes and their descriptions"""
+    modes_info = {
+        "available_modes": {
+            "default": {
+                "model": "jessica",
+                "description": "Core personality - general purpose battle buddy"
+            },
+            "business": {
+                "model": "jessica-business",
+                "description": "WyldePhyre operations - 4 divisions, SIK tracking, revenue focus"
+            }
+        },
+        "usage": "Include 'mode': 'business' in your chat request to switch modes"
+    }
+    return jsonify(modes_info)
 
 
 @app.route('/transcribe', methods=['POST'])
