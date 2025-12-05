@@ -82,13 +82,31 @@ Ensure `master_prompt.txt` is in the same directory as `jessica_core.py`. This f
 
 ## Usage
 
-### Starting the Server
+### Quick Start (All Services)
 
 ```bash
-python jessica_core.py
+# In WSL terminal
+source ~/.bashrc          # Load API keys
+~/start-jessica.sh        # Starts all backend services + frontend
 ```
 
-The server will start on `http://0.0.0.0:8000`
+### Manual Start
+
+```bash
+# Terminal 1: Start Ollama
+ollama serve
+
+# Terminal 2: Start backend
+cd ~/jessica-core
+source venv/bin/activate
+python jessica_core.py    # Runs on port 8000
+
+# Terminal 3: Start frontend
+cd ~/jessica-core/frontend
+npm run dev               # Runs on port 3000
+```
+
+Open http://localhost:3000 to use Jessica.
 
 ### API Endpoints
 
@@ -176,13 +194,43 @@ You can also explicitly specify a provider by including `"provider": "claude"` (
 
 ```
 jessica-core/
-├── jessica_core.py      # Main application file
+├── jessica_core.py      # Main backend API (Flask, port 8000)
 ├── master_prompt.txt    # Jessica's core personality and instructions
 ├── requirements.txt     # Python dependencies
-├── README.md           # This file
-├── CODE_REVIEW.md      # Code review and improvement suggestions
-└── venv/               # Virtual environment (excluded from git)
+├── README.md            # This file
+├── CODE_REVIEW.md       # Code review and improvement suggestions
+├── venv/                # Python virtual environment
+└── frontend/            # Next.js web interface
+    ├── app/
+    │   ├── page.tsx         # Chat interface (main page)
+    │   ├── status/page.tsx  # Service status dashboard
+    │   ├── memory/page.tsx  # Memory viewer + search
+    │   └── layout.tsx       # Root layout with navigation
+    ├── components/
+    │   ├── ChatInterface.tsx    # Main chat component
+    │   └── AudioUpload.tsx      # Audio transcription upload
+    └── lib/
+        └── api.ts           # Backend API client
 ```
+
+## Frontend
+
+The frontend is a Next.js 14 application with TypeScript and Tailwind CSS.
+
+### Running the Frontend
+
+```bash
+cd frontend
+npm install    # First time only
+npm run dev    # Development server on port 3000
+```
+
+### Frontend Features
+
+- **Chat Interface**: Send messages to Jessica, see routing info for each response
+- **Status Dashboard**: View all service connections (Ollama, APIs, memory)
+- **Memory Viewer**: Browse and search Mem0 cloud memories
+- **Audio Upload**: Transcribe audio files via Whisper service
 
 ## Development
 
