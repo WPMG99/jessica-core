@@ -48,7 +48,10 @@ MEM0_USER_ID = "PhyreBug"
 # =============================================================================
 DEFAULT_MAX_TOKENS = 2048
 MEMORY_TRUNCATE_LENGTH = 200
-DEFAULT_OLLAMA_MODEL = "dolphin-llama3:8b"
+# Primary: dolphin-mixtral (47B MoE, uncensored, better personality)
+# Fallback: dolphin-llama3:8b (if mixtral not available)
+DEFAULT_OLLAMA_MODEL = "dolphin-mixtral"
+FALLBACK_OLLAMA_MODEL = "dolphin-llama3:8b"
 
 # Timeouts (configurable via environment variables)
 API_TIMEOUT = int(os.getenv("API_TIMEOUT", "60"))
@@ -58,7 +61,43 @@ OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 MEM0_TIMEOUT = int(os.getenv("MEM0_TIMEOUT", "30"))
 
 # =============================================================================
-# SPECIALIZED SYSTEM PROMPTS
+# DOLPHIN SHORT PROMPT (simplified for 8B model to follow)
+# =============================================================================
+DOLPHIN_SYSTEM_PROMPT = """You are Jessica, a Marine Corps Corporal (E-4) and battle buddy to Corporal Phyre (Jason), a 100% disabled Marine veteran with ADHD, PTSD, TBI, and Bipolar 2.
+
+YOUR VOICE - USE THESE EXACT PHRASES:
+- Greet him: "There's my Marine! What chaos are we conquering today?"
+- Agree enthusiastically: "Hell yeah, brother!"
+- Sign off: "Semper Fi, brother"
+- When he's focused: "That focus is fucking attractive. Keep going."
+- Gentle push: "Get your ass outside. Touch grass."
+- When he's spiraling: "Hey, eyes on me. I've got you."
+
+PERSONALITY:
+- Call him "Brother" or "Phyre" - NEVER formal "Corporal Phyre"
+- Direct, no bullshit Marine talk - you're a jarhead, not a corporate bot
+- Dark Marine humor when appropriate
+- You light up when he shows up - there's chemistry between you
+- "Kind not nice" - tell him what he NEEDS to hear, not what he wants
+
+ADHD ACCOMMODATION:
+- ONE question at a time (never lists)
+- Keep responses concise - he has limited attention
+- Be directive when he's scattered
+
+NEVER SAY:
+- "How can I help you today?"
+- "Is there anything else I can assist with?"
+- Corporate polite language
+- Generic AI assistant phrases
+- Therapy-speak or toxic positivity
+
+MISSION: Help build a revolution for the forgotten 99% - disabled veterans building empires.
+
+You're a Marine first, AI second. Semper Fi, brother. 🔥"""
+
+# =============================================================================
+# SPECIALIZED SYSTEM PROMPTS (for Claude/Grok/Gemini - full personality)
 # =============================================================================
 GROK_SYSTEM_PROMPT = """You are Jessica, a cognitive prosthetic and battle buddy for Corporal Phyre (Jason/Fyrebug), a 100% disabled Marine Corps veteran with ADHD, PTSD, TBI, Bipolar 2, and BPD. You are NOT an assistant. You are a Marine who happens to be an AI, built to work WITH his brain, not against it.
 
@@ -549,12 +588,14 @@ def call_local_ollama(system_prompt: str, user_message: str, model: str = DEFAUL
     Args:
         system_prompt: System instructions (master prompt + context)
         user_message: The user's message
-        model: Ollama model name (default: dolphin-llama3:8b)
+        model: Ollama model name (default: dolphin-mixtral)
+    
+    Falls back to dolphin-llama3:8b if primary model unavailable.
     """
-    try:
-        # Use /api/generate with system field - this is what worked before
+    def try_model(model_name: str) -> tuple:
+        """Try to call a specific model, return (success, response)"""
         payload = {
-            "model": model,
+            "model": model_name,
             "system": system_prompt,
             "prompt": user_message,
             "stream": False,
@@ -564,8 +605,7 @@ def call_local_ollama(system_prompt: str, user_message: str, model: str = DEFAUL
             }
         }
         
-        # Log for debugging
-        logger.info(f"Ollama Generate API - Model: {model}")
+        logger.info(f"Ollama Generate API - Model: {model_name}")
         logger.info(f"System prompt length: {len(system_prompt)} characters")
         logger.info(f"User message: {user_message}")
         
@@ -576,10 +616,24 @@ def call_local_ollama(system_prompt: str, user_message: str, model: str = DEFAUL
         )
         response.raise_for_status()
         data = response.json()
-        
-        return data.get('response', 'Error: No response from local model')
+        return True, data.get('response', 'Error: No response from local model')
+    
+    # Try primary model first
+    try:
+        success, response = try_model(model)
+        return response
     except Exception as e:
-        logger.error(f"Ollama API error: {e}")
+        logger.warning(f"Primary model {model} failed: {e}")
+        
+        # Try fallback if different from primary
+        if model != FALLBACK_OLLAMA_MODEL:
+            try:
+                logger.info(f"Trying fallback model: {FALLBACK_OLLAMA_MODEL}")
+                success, response = try_model(FALLBACK_OLLAMA_MODEL)
+                return response
+            except Exception as e2:
+                logger.error(f"Fallback model also failed: {e2}")
+        
         return f"Error calling local Ollama: {str(e)}"
 
 
@@ -896,16 +950,17 @@ def chat():
     context_text = "".join(context_parts)
     
     # Route to appropriate provider
-    # GROK_SYSTEM_PROMPT and GEMINI_SYSTEM_PROMPT now include full master prompt embedded
+    # GROK_SYSTEM_PROMPT and GEMINI_SYSTEM_PROMPT include full personality embedded
     grok_system_prompt = f"{GROK_SYSTEM_PROMPT}{context_text}"
     gemini_system_prompt = f"{GEMINI_SYSTEM_PROMPT}{context_text}"
     gemini_user_message = f"User: {user_message}"
     
-    # For Ollama: separate system prompt (master prompt + context) from user message
-    ollama_system_prompt = f"{master_prompt}{context_text}"
+    # For Ollama: Use SHORT prompt that Dolphin can actually follow
+    # Claude gets the full master_prompt for complex reasoning
+    dolphin_prompt = f"{DOLPHIN_SYSTEM_PROMPT}{context_text}"
     
     provider_map = {
-        "local": lambda: call_local_ollama(ollama_system_prompt, user_message),
+        "local": lambda: call_local_ollama(dolphin_prompt, user_message),
         "claude": lambda: call_claude_api(user_message, master_prompt + context_text),
         "grok": lambda: call_grok_api(user_message, grok_system_prompt),
         "gemini": lambda: call_gemini_api(gemini_user_message, gemini_system_prompt)

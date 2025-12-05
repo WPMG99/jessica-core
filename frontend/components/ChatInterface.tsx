@@ -4,6 +4,8 @@ import { useState, useRef, useEffect } from 'react';
 import { sendMessage, ChatResponse, providerColors, providerNames } from '@/lib/api';
 import AudioUpload from './AudioUpload';
 
+type Provider = 'local' | 'claude' | 'grok' | 'gemini';
+
 interface Message {
   id: string;
   role: 'user' | 'jessica';
@@ -17,6 +19,7 @@ export default function ChatInterface() {
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<Provider | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -45,7 +48,7 @@ export default function ChatInterface() {
     setError(null);
 
     try {
-      const response = await sendMessage(userMessage.content);
+      const response = await sendMessage(userMessage.content, selectedProvider || undefined);
       
       const jessicaMessage: Message = {
         id: crypto.randomUUID(),
@@ -154,7 +157,32 @@ export default function ChatInterface() {
       </div>
 
       {/* Input area */}
-      <div className="border-t border-zinc-800 bg-[#0a0a0a]/80 backdrop-blur-md px-4 py-4">
+      <div className="border-t border-zinc-800 bg-[#0a0a0a]/80 backdrop-blur-md px-4 py-3">
+        {/* Provider Toggle */}
+        <div className="max-w-3xl mx-auto mb-3 flex items-center gap-2">
+          <span className="text-xs text-zinc-500 mr-2">Model:</span>
+          {[
+            { id: null, label: 'Auto', icon: '🤖' },
+            { id: 'local' as Provider, label: 'Local', icon: '🐬' },
+            { id: 'claude' as Provider, label: 'Claude', icon: '🧠' },
+            { id: 'grok' as Provider, label: 'Grok', icon: '🔍' },
+            { id: 'gemini' as Provider, label: 'Gemini', icon: '⚡' },
+          ].map((provider) => (
+            <button
+              key={provider.label}
+              type="button"
+              onClick={() => setSelectedProvider(provider.id)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                selectedProvider === provider.id
+                  ? 'bg-red-600 text-white'
+                  : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700 hover:text-white'
+              }`}
+            >
+              {provider.icon} {provider.label}
+            </button>
+          ))}
+        </div>
+
         <form onSubmit={handleSubmit} className="max-w-3xl mx-auto">
           <div className="flex items-end gap-3">
             <AudioUpload onTranscription={handleTranscription} />
