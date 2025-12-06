@@ -4,25 +4,48 @@ import hashlib
 import threading
 import logging
 import time
-from flask import Flask, request, jsonify
+import uuid
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 from functools import lru_cache
 from typing import Optional, Dict, List, Tuple
 from dotenv import load_dotenv
+from exceptions import ValidationError, ServiceUnavailableError, MemoryError, ExternalAPIError
+from retry_utils import retry_with_backoff, retry_on_timeout
 
 # Load environment variables from .env file BEFORE accessing them
 # This fixes the issue where bashrc exports don't reach non-interactive shells
 load_dotenv()
 
-# Configure logging
+# Configure logging with structured format
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# Custom formatter to handle missing request_id
+class RequestIDFormatter(logging.Formatter):
+    def format(self, record):
+        if not hasattr(record, 'request_id'):
+            record.request_id = getattr(g, 'request_id', 'N/A')
+        return super().format(record)
+
+# Apply custom formatter
+handler = logging.StreamHandler()
+handler.setFormatter(RequestIDFormatter('%(asctime)s - %(name)s - %(levelname)s - [%(request_id)s] - %(message)s'))
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend access
+
+# Request ID middleware
+@app.before_request
+def before_request():
+    """Generate request ID for tracking"""
+    g.request_id = request.headers.get('X-Request-ID', str(uuid.uuid4())[:8])
+    logger.info(f"Request started: {request.method} {request.path}")
 
 # Connection pooling for HTTP requests
 http_session = requests.Session()
@@ -998,15 +1021,20 @@ def _load_local_prompt():
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    # Input validation
-    if not request.json or 'message' not in request.json:
-        return jsonify({"error": "Missing 'message' field"}), 400
-    
-    data = request.json
-    user_message = data['message']
-    
-    if not isinstance(user_message, str) or len(user_message.strip()) == 0:
-        return jsonify({"error": "Message must be a non-empty string"}), 400
+    """Main chat endpoint with error handling"""
+    try:
+        # Input validation
+        if not request.json:
+            raise ValidationError("Request body must be JSON")
+        
+        if 'message' not in request.json:
+            raise ValidationError("Missing 'message' field")
+        
+        data = request.json
+        user_message = data['message']
+        
+        if not isinstance(user_message, str) or len(user_message.strip()) == 0:
+            raise ValidationError("Message must be a non-empty string")
     explicit_directive = data.get('provider', None)
     jessica_mode = data.get('mode', 'default')  # default, business, etc.
     
@@ -1063,15 +1091,29 @@ def chat():
         "gemini": lambda: call_gemini_api(gemini_user_message, gemini_system_prompt)
     }
     
-    response_text = provider_map.get(provider, provider_map["local"])()
-    
-    # Non-blocking memory storage
-    store_memory_dual(user_message, response_text, provider)
-    
-    return jsonify({
-        "response": response_text,
-        "routing": {"provider": provider, "tier": tier, "reason": reason}
-    })
+        response_text = provider_map.get(provider, provider_map["local"])()
+        
+        # Non-blocking memory storage
+        store_memory_dual(user_message, response_text, provider)
+        
+        return jsonify({
+            "response": response_text,
+            "routing": {"provider": provider, "tier": tier, "reason": reason},
+            "request_id": g.request_id
+        })
+    except ValidationError as e:
+        logger.warning(f"Validation error: {e.message}")
+        return jsonify({"error": e.message, "error_code": e.error_code, "request_id": g.request_id}), e.status_code
+    except (ServiceUnavailableError, ExternalAPIError) as e:
+        logger.error(f"Service error: {e.message}")
+        return jsonify({"error": e.message, "error_code": e.error_code, "request_id": g.request_id}), e.status_code
+    except Exception as e:
+        logger.error(f"Unexpected error in chat endpoint: {type(e).__name__}: {str(e)}", exc_info=True)
+        return jsonify({
+            "error": "An unexpected error occurred",
+            "error_code": "INTERNAL_ERROR",
+            "request_id": g.request_id
+        }), 500
 
 
 # =============================================================================
@@ -1094,27 +1136,44 @@ def get_all_cloud_memories():
 
 @app.route('/status', methods=['GET'])
 def status():
-    """Check status of all API connections"""
+    """Health check endpoint with detailed service status"""
     api_status = {
-        "local_ollama": False,
-        "local_memory": False,
-        "claude_api": bool(ANTHROPIC_API_KEY),
-        "grok_api": bool(XAI_API_KEY),
-        "gemini_api": bool(GOOGLE_AI_API_KEY),
-        "mem0_api": bool(MEM0_API_KEY)
+        "local_ollama": {"available": False, "response_time_ms": None, "error": None},
+        "local_memory": {"available": False, "response_time_ms": None, "error": None},
+        "claude_api": {"configured": bool(ANTHROPIC_API_KEY)},
+        "grok_api": {"configured": bool(XAI_API_KEY)},
+        "gemini_api": {"configured": bool(GOOGLE_AI_API_KEY)},
+        "mem0_api": {"configured": bool(MEM0_API_KEY)},
+        "request_id": g.request_id
     }
     
+    # Check Ollama service
     try:
+        start_time = time.time()
         r = http_session.get(f"{OLLAMA_URL}/api/tags", timeout=HEALTH_CHECK_TIMEOUT)
-        api_status["local_ollama"] = r.status_code == 200
+        response_time = (time.time() - start_time) * 1000
+        api_status["local_ollama"] = {
+            "available": r.status_code == 200,
+            "response_time_ms": round(response_time, 2),
+            "error": None
+        }
     except Exception as e:
         logger.error(f"Ollama status check failed: {e}")
+        api_status["local_ollama"]["error"] = str(e)
     
+    # Check Memory service
     try:
+        start_time = time.time()
         r = http_session.get(f"{MEMORY_URL}/health", timeout=HEALTH_CHECK_TIMEOUT)
-        api_status["local_memory"] = r.status_code == 200
+        response_time = (time.time() - start_time) * 1000
+        api_status["local_memory"] = {
+            "available": r.status_code == 200,
+            "response_time_ms": round(response_time, 2),
+            "error": None
+        }
     except Exception as e:
         logger.error(f"Memory service status check failed: {e}")
+        api_status["local_memory"]["error"] = str(e)
     
     return jsonify(api_status)
 
@@ -1140,22 +1199,41 @@ def get_modes():
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe_audio():
-    # Input validation
-    if 'audio' not in request.files:
-        return jsonify({"error": "No audio file provided"}), 400
-    
-    audio_file = request.files['audio']
-    if audio_file.filename == '':
-        return jsonify({"error": "No audio file selected"}), 400
-    
+    """Transcribe audio endpoint with error handling"""
     try:
+        # Input validation
+        if 'audio' not in request.files:
+            raise ValidationError("No audio file provided")
+        
+        audio_file = request.files['audio']
+        if audio_file.filename == '':
+            raise ValidationError("No audio file selected")
+        
         files = {'audio': audio_file}
+        start_time = time.time()
         response = http_session.post(f"{WHISPER_URL}/transcribe", files=files, timeout=API_TIMEOUT)
+        response_time = (time.time() - start_time) * 1000
         response.raise_for_status()
-        return response.json()
+        
+        result = response.json()
+        logger.info(f"Transcription completed in {response_time:.2f}ms")
+        return jsonify({**result, "request_id": g.request_id})
+    except ValidationError as e:
+        logger.warning(f"Validation error in transcribe: {e.message}")
+        return jsonify({"error": e.message, "error_code": e.error_code, "request_id": g.request_id}), e.status_code
+    except requests.exceptions.Timeout:
+        logger.error("Transcription service timeout")
+        raise ServiceUnavailableError("Whisper", "Transcription service timed out")
+    except requests.exceptions.ConnectionError:
+        logger.error("Transcription service connection error")
+        raise ServiceUnavailableError("Whisper", "Transcription service unavailable")
     except Exception as e:
-        logger.error(f"Transcription failed: {e}")
-        return jsonify({"error": "Transcription service unavailable"}), 503
+        logger.error(f"Transcription failed: {e}", exc_info=True)
+        return jsonify({
+            "error": "Transcription service unavailable",
+            "error_code": "SERVICE_UNAVAILABLE",
+            "request_id": g.request_id
+        }), 503
 
 
 # =============================================================================
@@ -1201,24 +1279,37 @@ def validate_environment() -> bool:
 # =============================================================================
 
 if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("JESSICA CORE v2.0 - Three-Tier Routing + Mem0")
-    print("="*60)
+    # Startup banner (also log it)
+    banner = "\n" + "="*60 + "\nJESSICA CORE v2.0 - Three-Tier Routing + Mem0\n" + "="*60
+    print(banner)
+    logger.info("Jessica Core starting up...")
     
     # Validate environment
     config_valid = validate_environment()
     
-    print(f"Claude API:     {'✓' if ANTHROPIC_API_KEY else '✗'}")
-    print(f"Grok API:       {'✓' if XAI_API_KEY else '✗'}")
-    print(f"Gemini API:     {'✓' if GOOGLE_AI_API_KEY else '✗'}")
-    print(f"Mem0 API:       {'✓' if MEM0_API_KEY else '✗'}")
-    print("="*60)
+    # Print and log configuration status
+    config_status = (
+        f"Claude API:     {'✓' if ANTHROPIC_API_KEY else '✗'}\n"
+        f"Grok API:       {'✓' if XAI_API_KEY else '✗'}\n"
+        f"Gemini API:     {'✓' if GOOGLE_AI_API_KEY else '✗'}\n"
+        f"Mem0 API:       {'✓' if MEM0_API_KEY else '✗'}\n"
+        + "="*60
+    )
+    print(config_status)
+    logger.info("API Configuration:\n" + config_status)
     
     if not config_valid:
-        print("\n⚠ WARNING: No AI providers configured!")
-        print("Set at least one of: ANTHROPIC_API_KEY, XAI_API_KEY, GOOGLE_AI_API_KEY")
-        print("Server will start but chat endpoints will fail.\n")
+        warning = (
+            "\n⚠ WARNING: No AI providers configured!\n"
+            "Set at least one of: ANTHROPIC_API_KEY, XAI_API_KEY, GOOGLE_AI_API_KEY\n"
+            "Server will start but chat endpoints will fail.\n"
+        )
+        print(warning)
+        logger.warning(warning)
     else:
-        print("\n✓ Configuration valid - at least one provider available\n")
+        success = "\n✓ Configuration valid - at least one provider available\n"
+        print(success)
+        logger.info(success)
     
+    logger.info("Starting Flask server on 0.0.0.0:8000")
     app.run(host='0.0.0.0', port=8000)

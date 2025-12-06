@@ -71,3 +71,14 @@ node_modules/
 coverage/
 tsconfig.tsbuildinfo
 
+# ChromaDB / Memory Database files
+*.sqlite3
+*.bin
+**/chroma.sqlite3
+**/jessica-memory/**
+**/jessica_memory/**
+**/data_level0.bin
+**/header.bin
+**/length.bin
+**/link_lists.bin
+
